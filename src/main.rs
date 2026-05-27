@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let upstream = UdpSocket::from_std(upstream_std_socket)?;
 
     let mut cache: LruCache<DNSCacheKey, DNSCacheEntry> =
-        LruCache::new(NonZeroUsize::new(100).unwrap());
+        LruCache::new(NonZeroUsize::new(10_000).unwrap());
     println!("UDP server listening on {}", server_addr);
 
     loop {
