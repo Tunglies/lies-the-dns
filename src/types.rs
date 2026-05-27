@@ -1,6 +1,8 @@
 use std::fmt::{Debug, Display};
 use std::net::Ipv4Addr;
 
+use bytes::Bytes;
+
 pub struct DNSHeader {
     pub id: u16,
     pub flags: u16,
@@ -10,23 +12,23 @@ pub struct DNSHeader {
     pub arcount: u16,
 }
 
-pub struct DNSQuestion<'a> {
-    pub qname: Vec<&'a [u8]>,
+pub struct DNSQuestion {
+    pub qname: Bytes,
     pub qtype: u16,
     pub qclass: u16,
 }
 
-pub struct DNSAnswer<'a> {
-    pub name: Vec<&'a [u8]>,
+pub struct DNSAnswer {
+    pub name: Bytes,
     pub atype: u16,
     pub aclass: u16,
     pub ttl: u32,
-    pub rdata: RData<'a>,
+    pub rdata: RData,
 }
 
-pub enum RData<'a> {
+pub enum RData {
     A(Ipv4Addr),
-    Unkownn(&'a [u8]),
+    Unkownn(Bytes),
 }
 
 impl Debug for DNSHeader {
@@ -42,36 +44,59 @@ impl Debug for DNSHeader {
     }
 }
 
-impl Display for DNSQuestion<'_> {
+impl Display for DNSQuestion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for (i, label) in self.qname.iter().enumerate() {
-            if i > 0 {
-                write!(f, ".")?;
+        let mut parts = Vec::new();
+        let mut pos = 0;
+        while pos < self.qname.len() {
+            let len = self.qname[pos] as usize;
+            if len == 0 {
+                break;
             }
-            write!(f, "{}", String::from_utf8_lossy(label))?;
-        }
-        write!(f, " (Type: {}, Class: {})", self.qtype, self.qclass)
-    }
-}
-
-impl Display for DNSAnswer<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for (i, label) in self.name.iter().enumerate() {
-            if i > 0 {
-                write!(f, ".")?;
+            pos += 1;
+            if pos + len <= self.qname.len() {
+                parts.push(String::from_utf8_lossy(&self.qname[pos..pos + len]).to_string());
             }
-            write!(f, "{}", String::from_utf8_lossy(label))?;
+            pos += len;
         }
-
         write!(
             f,
-            " (Type: {}, Class: {}, TTL: {}, RDATA: {})",
-            self.atype, self.aclass, self.ttl, self.rdata
+            "{} (Type: {}, Class: {})",
+            parts.join("."),
+            self.qtype,
+            self.qclass
         )
     }
 }
 
-impl Display for RData<'_> {
+impl Display for DNSAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut parts = Vec::new();
+        let mut pos = 0;
+        while pos < self.name.len() {
+            let len = self.name[pos] as usize;
+            if len == 0 {
+                break;
+            }
+            pos += 1;
+            if pos + len <= self.name.len() {
+                parts.push(String::from_utf8_lossy(&self.name[pos..pos + len]).to_string());
+            }
+            pos += len;
+        }
+        write!(
+            f,
+            "{} (Type: {}, Class: {}, TTL: {}, RDATA: {})",
+            parts.join("."),
+            self.atype,
+            self.aclass,
+            self.ttl,
+            self.rdata
+        )
+    }
+}
+
+impl Display for RData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RData::A(ip) => write!(f, "{}", ip),
@@ -94,9 +119,9 @@ pub fn parse_dns_header(buf: &[u8]) -> Option<DNSHeader> {
     })
 }
 
-pub fn parse_dns_question<'a>(buf: &'a [u8], offset: usize) -> Option<(DNSQuestion<'a>, usize)> {
+pub fn parse_dns_question(buf: &Bytes, offset: usize) -> Option<(DNSQuestion, usize)> {
     let mut pos = offset;
-    let mut qname_parts = Vec::new();
+    let start = offset;
     while pos < buf.len() {
         let len = buf[pos] as usize;
         if len == 0 {
@@ -107,12 +132,12 @@ pub fn parse_dns_question<'a>(buf: &'a [u8], offset: usize) -> Option<(DNSQuesti
         if pos + len > buf.len() {
             return None;
         }
-        qname_parts.push(&buf[pos..pos + len]);
         pos += len;
     }
     if pos + 4 > buf.len() {
         return None;
     }
+    let qname_parts = buf.slice(start..pos);
     let qtype = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
     let qclass = u16::from_be_bytes([buf[pos + 2], buf[pos + 3]]);
     Some((
@@ -125,9 +150,9 @@ pub fn parse_dns_question<'a>(buf: &'a [u8], offset: usize) -> Option<(DNSQuesti
     ))
 }
 
-pub fn parse_dns_answer<'a>(buf: &'a [u8], offset: usize) -> Option<(DNSAnswer<'a>, usize)> {
+pub fn parse_dns_answer(buf: &Bytes, offset: usize) -> Option<(DNSAnswer, usize)> {
     let mut pos = offset;
-    let mut name_parts = Vec::new();
+    let start = offset;
     let mut next_pos = None;
     let mut jump_count = 0;
 
@@ -163,11 +188,12 @@ pub fn parse_dns_answer<'a>(buf: &'a [u8], offset: usize) -> Option<(DNSAnswer<'
         if pos + len > buf.len() {
             return None;
         }
-        name_parts.push(&buf[pos..pos + len]);
         pos += len;
     }
 
     let final_pos = next_pos.unwrap_or(pos);
+    let name_end = next_pos.unwrap_or(pos);
+    let name_parts = buf.slice(start..name_end);
 
     if final_pos + 10 > buf.len() {
         return None;
@@ -187,9 +213,8 @@ pub fn parse_dns_answer<'a>(buf: &'a [u8], offset: usize) -> Option<(DNSAnswer<'
         return None;
     }
 
-    let rdata_raw = &buf[final_pos + 10..final_pos + 10 + rdlength];
+    let rdata_raw = buf.slice(final_pos + 10..final_pos + 10 + rdlength);
 
-    // TODO: Support more record types to parse atype and rdata properly
     let rdata = match atype {
         1 if rdlength == 4 => RData::A(Ipv4Addr::new(
             rdata_raw[0],
