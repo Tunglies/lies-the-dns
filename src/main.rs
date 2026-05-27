@@ -1,11 +1,15 @@
 mod types;
 
-use std::net::SocketAddr;
+use std::{net::SocketAddr, num::NonZeroUsize, time::Instant};
 
+use lru::LruCache;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
 
-use crate::types::{parse_dns_answer, parse_dns_header, parse_dns_question};
+use crate::types::{
+    DNSCacheEntry, DNSCacheKey, get_cached_entry, parse_dns_answer, parse_dns_header,
+    parse_dns_question, put_cached_response,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -30,6 +34,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = UdpSocket::from_std(server_std_socket)?;
     let upstream = UdpSocket::from_std(upstream_std_socket)?;
 
+    let mut cache: LruCache<DNSCacheKey, DNSCacheEntry> =
+        LruCache::new(NonZeroUsize::new(100).unwrap());
     println!("UDP server listening on {}", server_addr);
 
     loop {
@@ -45,7 +51,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let dns_question_parse = parse_dns_question(&request_buf, 12).unwrap();
         println!("Parsed DNS question: {}", dns_question_parse.0);
 
-        upstream.send_to(&request_buf[..len], upstream_dns).await?;
+        if let Some(cached_entry) = get_cached_entry(&mut cache, &dns_question_parse.0.key()) {
+            let mut cached_raw = cached_entry.raw.to_vec();
+            cached_raw[0..2].copy_from_slice(&request_buf[0..2]);
+            server.send_to(&cached_raw, src).await?;
+            println!("Cache hit for question: {}", dns_question_parse.0);
+            let exppected_expire_at = cached_entry
+                .expire_at
+                .saturating_duration_since(Instant::now());
+            println!(
+                "Sent cached response back to client at {}, expires in {:?}",
+                src, exppected_expire_at
+            );
+            continue;
+        }
+
+        println!("Cache miss for question: {}", dns_question_parse.0);
+
+        upstream.send_to(&request_buf, upstream_dns).await?;
         println!(
             "Forwarded packet to upstream DNS server at {}",
             upstream_dns
@@ -60,12 +83,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Parsed DNS response header: {:?}", dns_response_parse);
 
         let mut offset = 12;
+        let mut questions = Vec::new();
+        let mut answers = Vec::new();
+
         for _ in 0..dns_response_parse.qdcount {
             let (question_parse, next_offset) = parse_dns_question(&response_buf, offset).unwrap();
             println!(
                 "Parsed DNS question(total: {}) in response: {}",
                 dns_response_parse.qdcount, question_parse
             );
+            questions.push(question_parse);
             offset = next_offset;
         }
         for _ in 0..dns_response_parse.ancount {
@@ -74,10 +101,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "Parsed DNS answer(total: {}) in response: {}",
                 dns_response_parse.ancount, anser_parse
             );
+            answers.push(anser_parse);
             offset = next_offset;
         }
 
-        server.send_to(&response_buf[..len], src).await?;
+        server.send_to(&response_buf, src).await?;
         println!("Sent response back to client at {}", src);
+        put_cached_response(&mut cache, &questions, &answers, response_buf);
     }
 }

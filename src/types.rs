@@ -1,7 +1,10 @@
+use std::collections::HashMap;
 use std::fmt::{Debug, Display};
 use std::net::Ipv4Addr;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use lru::LruCache;
 
 pub struct DNSHeader {
     pub id: u16,
@@ -12,23 +15,53 @@ pub struct DNSHeader {
     pub arcount: u16,
 }
 
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub struct DNSQuestion {
-    pub qname: Bytes,
+    pub qname: String,
     pub qtype: u16,
     pub qclass: u16,
 }
+pub type DNSCacheKey = DNSQuestion;
 
+#[derive(Clone, Debug)]
 pub struct DNSAnswer {
-    pub name: Bytes,
+    pub name: String,
     pub atype: u16,
     pub aclass: u16,
     pub ttl: u32,
     pub rdata: RData,
 }
 
+#[derive(Clone, Debug)]
+pub struct DNSCacheEntry {
+    pub expire_at: Instant,
+    pub raw: Bytes,
+}
+
+#[derive(Clone, Debug)]
 pub enum RData {
     A(Ipv4Addr),
-    Unkownn(Bytes),
+    Unknown(Bytes),
+}
+
+impl DNSQuestion {
+    pub fn key(&self) -> DNSCacheKey {
+        DNSCacheKey {
+            qname: self.qname.clone(),
+            qtype: self.qtype,
+            qclass: self.qclass,
+        }
+    }
+}
+
+impl DNSAnswer {
+    pub fn key(&self) -> DNSCacheKey {
+        DNSCacheKey {
+            qname: self.name.clone(),
+            qtype: self.atype,
+            qclass: self.aclass,
+        }
+    }
 }
 
 impl Debug for DNSHeader {
@@ -46,52 +79,20 @@ impl Debug for DNSHeader {
 
 impl Display for DNSQuestion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut parts = Vec::new();
-        let mut pos = 0;
-        while pos < self.qname.len() {
-            let len = self.qname[pos] as usize;
-            if len == 0 {
-                break;
-            }
-            pos += 1;
-            if pos + len <= self.qname.len() {
-                parts.push(String::from_utf8_lossy(&self.qname[pos..pos + len]).to_string());
-            }
-            pos += len;
-        }
         write!(
             f,
             "{} (Type: {}, Class: {})",
-            parts.join("."),
-            self.qtype,
-            self.qclass
+            self.qname, self.qtype, self.qclass
         )
     }
 }
 
 impl Display for DNSAnswer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut parts = Vec::new();
-        let mut pos = 0;
-        while pos < self.name.len() {
-            let len = self.name[pos] as usize;
-            if len == 0 {
-                break;
-            }
-            pos += 1;
-            if pos + len <= self.name.len() {
-                parts.push(String::from_utf8_lossy(&self.name[pos..pos + len]).to_string());
-            }
-            pos += len;
-        }
         write!(
             f,
             "{} (Type: {}, Class: {}, TTL: {}, RDATA: {})",
-            parts.join("."),
-            self.atype,
-            self.aclass,
-            self.ttl,
-            self.rdata
+            self.name, self.atype, self.aclass, self.ttl, self.rdata
         )
     }
 }
@@ -100,7 +101,7 @@ impl Display for RData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RData::A(ip) => write!(f, "{}", ip),
-            RData::Unkownn(data) => write!(f, "{:02x?}", data),
+            RData::Unknown(data) => write!(f, "{:02x?}", data),
         }
     }
 }
@@ -120,100 +121,52 @@ pub fn parse_dns_header(buf: &[u8]) -> Option<DNSHeader> {
 }
 
 pub fn parse_dns_question(buf: &Bytes, offset: usize) -> Option<(DNSQuestion, usize)> {
-    let mut pos = offset;
-    let start = offset;
-    while pos < buf.len() {
-        let len = buf[pos] as usize;
-        if len == 0 {
-            pos += 1;
-            break;
-        }
-        pos += 1;
-        if pos + len > buf.len() {
-            return None;
-        }
-        pos += len;
-    }
+    let (qname, mut pos) = parse_dns_name(buf, offset)?;
+
     if pos + 4 > buf.len() {
         return None;
     }
-    let qname_parts = buf.slice(start..pos);
+
     let qtype = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
-    let qclass = u16::from_be_bytes([buf[pos + 2], buf[pos + 3]]);
+    pos += 2;
+
+    let qclass = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
+    pos += 2;
+
     Some((
         DNSQuestion {
-            qname: qname_parts,
+            qname,
             qtype,
             qclass,
         },
-        pos + 4,
+        pos,
     ))
 }
 
 pub fn parse_dns_answer(buf: &Bytes, offset: usize) -> Option<(DNSAnswer, usize)> {
-    let mut pos = offset;
-    let start = offset;
-    let mut next_pos = None;
-    let mut jump_count = 0;
+    let (name, mut pos) = parse_dns_name(buf, offset)?;
 
-    while pos < buf.len() {
-        let len = buf[pos] as usize;
-
-        if len & 0xC0 == 0xC0 {
-            if jump_count > 5 {
-                return None;
-            }
-            if pos + 1 >= buf.len() {
-                return None;
-            }
-
-            let offset_bytes = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
-            let pointer_offset = (offset_bytes & 0x3FFF) as usize;
-
-            if next_pos.is_none() {
-                next_pos = Some(pos + 2);
-            }
-
-            pos = pointer_offset;
-            jump_count += 1;
-            continue;
-        }
-
-        if len == 0 {
-            pos += 1;
-            break;
-        }
-
-        pos += 1;
-        if pos + len > buf.len() {
-            return None;
-        }
-        pos += len;
-    }
-
-    let final_pos = next_pos.unwrap_or(pos);
-    let name_end = next_pos.unwrap_or(pos);
-    let name_parts = buf.slice(start..name_end);
-
-    if final_pos + 10 > buf.len() {
+    if pos + 10 > buf.len() {
         return None;
     }
 
-    let atype = u16::from_be_bytes([buf[final_pos], buf[final_pos + 1]]);
-    let aclass = u16::from_be_bytes([buf[final_pos + 2], buf[final_pos + 3]]);
-    let ttl = u32::from_be_bytes([
-        buf[final_pos + 4],
-        buf[final_pos + 5],
-        buf[final_pos + 6],
-        buf[final_pos + 7],
-    ]);
-    let rdlength = u16::from_be_bytes([buf[final_pos + 8], buf[final_pos + 9]]) as usize;
+    let atype = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
+    pos += 2;
 
-    if final_pos + 10 + rdlength > buf.len() {
+    let aclass = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
+    pos += 2;
+
+    let ttl = u32::from_be_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]);
+    pos += 4;
+
+    let rdlength = u16::from_be_bytes([buf[pos], buf[pos + 1]]) as usize;
+    pos += 2;
+
+    if pos + rdlength > buf.len() {
         return None;
     }
 
-    let rdata_raw = buf.slice(final_pos + 10..final_pos + 10 + rdlength);
+    let rdata_raw = buf.slice(pos..pos + rdlength);
 
     let rdata = match atype {
         1 if rdlength == 4 => RData::A(Ipv4Addr::new(
@@ -222,17 +175,123 @@ pub fn parse_dns_answer(buf: &Bytes, offset: usize) -> Option<(DNSAnswer, usize)
             rdata_raw[2],
             rdata_raw[3],
         )),
-        _ => RData::Unkownn(rdata_raw),
+        _ => RData::Unknown(rdata_raw),
     };
 
     Some((
         DNSAnswer {
-            name: name_parts,
+            name,
             atype,
             aclass,
             ttl,
             rdata,
         },
-        final_pos + 10 + rdlength,
+        pos + rdlength,
     ))
+}
+
+pub fn get_cached_entry<'a>(
+    cache: &'a mut LruCache<DNSCacheKey, DNSCacheEntry>,
+    key: &DNSCacheKey,
+) -> Option<&'a DNSCacheEntry> {
+    let expired = match cache.peek(key) {
+        Some(entry) => Instant::now() > entry.expire_at,
+        None => return None,
+    };
+
+    if expired {
+        cache.pop(key);
+        return None;
+    }
+
+    cache.get(key)
+}
+
+pub fn put_cached_response(
+    cache: &mut LruCache<DNSCacheKey, DNSCacheEntry>,
+    questions: &[DNSQuestion],
+    answers: &[DNSAnswer],
+    raw: Bytes,
+) {
+    let mut bucket: HashMap<DNSCacheKey, Vec<DNSAnswer>> = HashMap::new();
+
+    for answer in answers {
+        bucket.entry(answer.key()).or_default().push(answer.clone());
+    }
+
+    for question in questions {
+        let key = question.key();
+
+        if let Some(matched_answers) = bucket.remove(&key) {
+            let min_ttl = matched_answers.iter().map(|a| a.ttl).min().unwrap_or(0);
+
+            if min_ttl == 0 {
+                continue;
+            }
+
+            let entry = DNSCacheEntry {
+                expire_at: Instant::now() + Duration::from_secs(min_ttl as u64),
+                raw: raw.clone(),
+            };
+
+            cache.put(key, entry);
+        }
+    }
+}
+
+fn parse_dns_name(buf: &Bytes, offset: usize) -> Option<(String, usize)> {
+    let mut pos = offset;
+    let mut labels = Vec::new();
+    let mut jumped = false;
+    let mut next_pos = offset;
+    let mut jump_count = 0;
+
+    loop {
+        if pos >= buf.len() {
+            return None;
+        }
+
+        let len = buf[pos];
+
+        if len & 0xC0 == 0xC0 {
+            if pos + 1 >= buf.len() {
+                return None;
+            }
+
+            if jump_count > 8 {
+                return None;
+            }
+
+            let pointer = (((len & 0x3F) as usize) << 8) | buf[pos + 1] as usize;
+
+            if !jumped {
+                next_pos = pos + 2;
+            }
+
+            pos = pointer;
+            jumped = true;
+            jump_count += 1;
+            continue;
+        }
+
+        if len == 0 {
+            if !jumped {
+                next_pos = pos + 1;
+            }
+            break;
+        }
+
+        let label_len = len as usize;
+        pos += 1;
+
+        if pos + label_len > buf.len() {
+            return None;
+        }
+
+        let label = std::str::from_utf8(&buf[pos..pos + label_len]).ok()?;
+        labels.push(label.to_string());
+        pos += label_len;
+    }
+
+    Some((labels.join("."), next_pos))
 }
