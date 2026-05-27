@@ -290,7 +290,7 @@ fn parse_dns_name(buf: &Bytes, offset: usize) -> Option<(String, usize)> {
         }
 
         let label = std::str::from_utf8(&buf[pos..pos + label_len]).ok()?;
-        labels.push(label.to_string());
+        labels.push(label);
         pos += label_len;
     }
 
