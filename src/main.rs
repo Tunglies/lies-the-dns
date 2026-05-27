@@ -1,7 +1,11 @@
+mod types;
+
 use std::net::SocketAddr;
 
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
+
+use crate::types::{parse_dns_header, parse_dns_question};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -33,6 +37,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Waiting for incoming UDP packets...");
         let (len, src) = server.recv_from(&mut buf).await?;
         println!("Received {} bytes from {}", len, src);
+        let dns_parse = parse_dns_header(&buf[..len]).unwrap();
+        println!("Parsed DNS header: {:?}", dns_parse);
+        let dns_question_parse = parse_dns_question(&buf[..len]).unwrap();
+        println!("Parsed DNS question: {}", dns_question_parse.0);
 
         upstream.send_to(&buf[..len], upstream_dns).await?;
         println!(
@@ -42,6 +50,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let (len, _) = upstream.recv_from(&mut buf).await?;
         println!("Received response from upstream DNS server");
+        let dns_response_parse = parse_dns_header(&buf[..len]).unwrap();
+        println!("Parsed DNS response header: {:?}", dns_response_parse);
+        let dns_response_question_parse = parse_dns_question(&buf[..len]).unwrap();
+        println!(
+            "Parsed DNS response question: {}",
+            dns_response_question_parse.0
+        );
 
         server.send_to(&buf[..len], src).await?;
         println!("Sent response back to client at {}", src);
