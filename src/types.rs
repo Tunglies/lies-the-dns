@@ -47,7 +47,7 @@ pub enum RData {
 impl DNSQuestion {
     pub fn key(&self) -> DNSCacheKey {
         DNSCacheKey {
-            qname: self.qname.clone(),
+            qname: self.qname.to_lowercase(),
             qtype: self.qtype,
             qclass: self.qclass,
         }
@@ -57,7 +57,7 @@ impl DNSQuestion {
 impl DNSAnswer {
     pub fn key(&self) -> DNSCacheKey {
         DNSCacheKey {
-            qname: self.name.clone(),
+            qname: self.name.to_lowercase(),
             qtype: self.atype,
             qclass: self.aclass,
         }
@@ -200,6 +200,7 @@ pub fn get_cached_entry<'a>(
     };
 
     if expired {
+        println!("Cache expired for key: {:?}", key);
         cache.pop(key);
         return None;
     }
